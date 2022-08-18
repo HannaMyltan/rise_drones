@@ -6,6 +6,9 @@ import threading
 import time
 import traceback
 import typing
+import sys
+import datetime
+import os
 
 import zmq
 
@@ -13,9 +16,16 @@ import dss.auxiliaries
 from dss.auxiliaries.config import config
 import dss.client
 
+# Requires a modem class
+try:
+  sys.path.append('/home/pi/rise_drones_dev/modem')
+  from modem import Modem
+except ImportError:
+  print('No module modem found. RISE proprietary code')
+
 __author__ = 'Lennart Ochel <lennart.ochel@ri.se>, Andreas Gising <andreas.gising@ri.se>, Kristoffer Bergman <kristoffer.bergman@ri.se>, Hanna Müller <hanna.muller@ri.se>, Joel Nordahl'
 __version__ = '1.1.0'
-__copyright__ = 'Copyright (c) 2019-2021, RISE'
+__copyright__ = 'Copyright (c) 2019-2022, RISE'
 __status__ = 'development'
 
 class Server:
@@ -85,6 +95,7 @@ class Server:
     if photo:
       self._photo = dss.server.photo.Client(self._zmq_context, config['DSS']['PhotoClient'])
       self._logger.info('Connecting to photo client on %s... done', config['DSS']['PhotoClient'])
+
 
     # all attributes are disabled by default
     self._pub_attributes = {'ATT':                   {'enabled': False, 'name': 'attitude'},
@@ -169,11 +180,17 @@ class Server:
     glana_thread = threading.Thread(target=self._main_glana, daemon=True)
     glana_thread.start()
 
+    # start network log thread
+    network_thread = threading.Thread(target=self._main_network, daemon=True)
+    network_thread.start()
+
     # register dss
     if crm:
+      self._capabilities = config['DSS']['Capabilities']
       self._crm = dss.client.CRM(self._zmq_context, crm, app_name='crm_dss.py', desc=description, app_id=self._dss_id)
       #register and start sending heartbeat to the CRM
-      answer = self._crm.register(self._dss_ip, self._serv_socket.port, type='dss')
+      self._logger.info(f"registering to CRM with capabilities: {self._capabilities}")
+      answer = self._crm.register(self._dss_ip, self._serv_socket.port, type='dss', capabilities=self._capabilities)
       if dss.auxiliaries.zmq.is_ack(answer):
         self._dss_id = answer['id']
       else:
@@ -181,6 +198,7 @@ class Server:
         self.alive = False
     else:
       self._crm = None
+      self._capabilities = None
 
   def exit_gracefully(self, *args):
     self._logger.warning('Shutdown due to interrupt')
@@ -334,7 +352,7 @@ class Server:
       answer = dss.auxiliaries.zmq.nack(fcn, 'Application is not in controls')
     elif self._hexa.get_nsat() < 8:
       answer = dss.auxiliaries.zmq.nack(fcn, 'Less than 8 satellites')
-    elif self._hexa.is_flying(): # Actually it is the armed state that is tested
+    elif self._hexa.is_armed(): # Actually it is the armed state that is tested
       answer = dss.auxiliaries.zmq.nack(fcn, 'State is flying')
     elif not 2 <= to_alt <= 40:
       answer = dss.auxiliaries.zmq.nack(fcn, 'Height is out of limits')
@@ -353,7 +371,7 @@ class Server:
       answer = dss.auxiliaries.zmq.nack(fcn, descr)
     elif self._in_controls != 'APPLICATION':
       answer = dss.auxiliaries.zmq.nack(fcn, 'Application is not in controls')
-    elif not self._hexa.is_flying(): # Actually it is the armed state that is tested
+    elif not self._hexa.is_armed(): # Actually it is the armed state that is tested
       answer = dss.auxiliaries.zmq.nack(fcn, 'State is not flying')
     # Accept
     else:
@@ -876,16 +894,16 @@ class Server:
 
   def _attribute_listener(self, vehicle, att_name, msg):
     if att_name == 'attitude':
-      msg = {"Data": "att", "r": msg.roll, "p": msg.pitch, "y": msg.yaw}
+      msg = {"r": msg.roll, "p": msg.pitch, "y": msg.yaw}
       self._pub_socket.publish('ATT', msg)
       #print("Attitude callback sending log data:", json_msg)
     # LLA
     elif att_name == 'location.global_frame':
-      msg = {'lat': msg.lat, 'lon': msg.lon, 'alt': msg.alt, 'heading': -1, 'agl': -1 } # TODO heading and AGL
+      msg = {'lat': msg.lat, 'lon': msg.lon, 'alt': msg.alt, 'heading': vehicle.heading, 'velocity': vehicle.velocity, 'gnss_state': self._hexa.gnss_state, 'agl': -1 }
       self._pub_socket.publish('LLA', msg)
     # NED
     elif att_name == 'location.local_frame':
-      msg = {'north': msg.north, 'east': msg.east, 'down': msg.down, 'heading': -1, 'agl': -1} # TODO heading and AGL
+      msg = {'north': msg.north, 'east': msg.east, 'down': msg.down, 'heading': vehicle.heading, 'velocity': vehicle.velocity, 'agl': -1}
       self._pub_socket.publish('NED', msg)
     else:
       self._logger.error('Unknown attribute send to listener: %s', att_name)
@@ -941,6 +959,103 @@ class Server:
           self._hexa.glana.stop_rec()
           self._hexa.set_gimbal(-1, 0, 0)
           self._logger.error("Client doesn't have the control anymore... stopped recording")
+
+  #############################################################################
+  # THREAD *NETWORK LOG*
+  #############################################################################
+
+  def _main_network(self):
+    '''Monitors and logs the network status'''
+    self._logger.info("MODEM: Network logger thread enabled")
+
+    # Connect to modem on specified path
+    try:
+      self._modem = Modem("/dev/ttyUSB2")
+      self._logger.info('MODEM: Connected to modem on /dev/ttyUSB2')
+    except:
+      self._logger.info('MODEM: Could not find modem device, ttyUSB2')
+      # Try the other port
+      try:
+        self._modem = Modem("/dev/ttyUSB3")
+        self._logger.info('MODEM: Connected to modem on /dev/ttyUSB3')
+      except:
+        self._logger.info('MODEM: Could not find modem device, ttyUSB3')
+        self._logger.warning('MODEM: Cound not find mode device. Quit network logger thread')
+        return
+
+    # Set up Engineering mode
+    # Set up reporting of cell id
+    if self._modem.set_modem('network_reg_set_opt2'):
+      self._logger.info("MODEM: Modem set to report Cell-ID on request")
+    else:
+      self._logger.warning("MODEM: FAILED to set Modem to report Cell-ID on request")
+
+    # Allocate logfiles
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    log_items_filename = '{}_{}'.format(timestamp, 'network-log-items.txt')
+    log_filename = '{}_{}'.format(timestamp, 'network-log.json')
+    log_items = 'log/' + log_items_filename
+    log_file = 'log/' + log_filename
+
+    # Poll static infomration
+    static = self._modem.get_static_info()
+    self._logger.info(f'MODEM: imei: {static["imei"]}, number: {static["number"]}')
+
+    # Save static information and leave out final curly bracket
+    with open(log_items, 'w', encoding="utf-8") as outfile:
+          # Manually add the key to prevent the final curly bracket
+          outfile.write('{ "static_info":')
+          # Write the log_item as a string under the newly added key
+          outfile.write(json.dumps(static))
+
+    # Wait for vehicle to arm
+    while not self._hexa.is_armed():
+      time.sleep(0.5)
+
+    # Enter loop to collect data until landed for xx seconds
+    index = 0
+    t_landed = 0
+    t_sleep = 1
+    t_landed_threshold = 15/t_sleep # Unit seconds
+    while t_landed < t_landed_threshold :
+        if self._hexa.flying_state == 'landed':
+          t_landed += t_sleep
+        else:
+          t_landed = 0
+        # Get dynamic info, keys: serving, neighbour and time
+        log_item = self._modem.get_cell_info()
+
+        # Add pos data
+        pos = self._hexa.get_position_lla_global()
+        log_item['pos'] = {}
+        log_item['pos']['lat'] = pos.lat
+        log_item['pos']['long'] = pos.lon
+        log_item['pos']['alt'] = pos.alt
+        log_item['pos']['fix_type'] = self._hexa.gnss_state_str
+
+        # Save the log_item under a new key in the log file built line by line
+        with open(log_items, 'a', encoding="utf-8") as outfile:
+          # Write comma to previous line
+          outfile.write(',')
+          # Add a new numbered key manually
+          new_key = '"' + str(index) + '"' + ':'
+          outfile.write(new_key)
+          # write the log_item as a string under the newly added key
+          outfile.write(json.dumps(log_item))
+        time.sleep(t_sleep)
+        index+=1
+
+    # Add the final curly bracket
+    with open(log_items, 'a', encoding="utf-8") as outfile:
+      outfile.write('}')
+
+    # Open the log file and save it in an other file with pretty print
+    with open(log_items, 'r', encoding="utf-8") as infile:
+      big_json = json.load(infile)
+      with open(log_file, 'w', encoding="utf-8") as outfile:
+        log_str = json.dumps(big_json, indent=4)
+        outfile.write(log_str)
+    self._logger.info("MODEM: Logging complete!")
 
   #############################################################################
   # THREAD *MAIN*

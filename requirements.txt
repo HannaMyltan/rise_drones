@@ -7,12 +7,13 @@ GitPython==3.1.24
 iniconfig==1.1.1
 isort==5.10.1
 lazy-object-proxy==1.7.1
-lxml==4.8.0
+lxml==4.9.1
 mccabe==0.6.1
 monotonic==1.6
 netifaces==0.11.0
 numpy==1.22.1
 packaging==21.3
+paho-mqtt==1.6.1
 platformdirs==2.4.1
 pluggy==1.0.0
 py==1.11.0
